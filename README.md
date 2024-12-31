@@ -1,9 +1,9 @@
 <h1 align="center">vpilot-alert <img alt="Views" src="https://lambda.348575.xyz/repo-view-counter?repo=vpilot-alert"/></h1>
 
-A server, [vPilot](https://vpilot.rosscarlson.dev/) plugin, and android app to play an alarm when you get message in vPilot.
+A server, [vPilot](https://vpilot.rosscarlson.dev/) plugin, and an android app to play an alarm when you get message in vPilot (private message, callsign on radio, selcal).
 
 ## Usage
-1. Grab the latest release zip [here](https://github.com/t348575/twitch-points-miner/releases) and extract the contents.
+1. Grab the latest release zip [here](https://github.com/t348575/vpilot-alert/releases) and extract the contents.
 2. Copy `AlertPlugin.dll` to your vPilot plugin folder, usually here: `C:\Users\<your username>\AppData\Local\vPilot\Plugins`.
     * If you want to have external access (with a domain name for example) create a file `baseUrl.txt` in the same folder as the plugin, the contents being the base url to access your server, default is `http://localhost:8080/vpilot-alert/api`
 3. Open and connect vPilot.
