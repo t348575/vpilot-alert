@@ -11,5 +11,7 @@ A server, [vPilot](https://vpilot.rosscarlson.dev/) plugin, and an android app t
 5. Install the APK on your device, and configure the URL to access the server in the settings page, ie. the domain name or IP of the machine running the server.
     * Be sure to select an alarm sound as well
     * **NOTE:** On first install, its important to have the server running before opening the app, so that it can register itself for notifications with the server.
+  
+ * For debugging purposes, you can set the environment variable `LOG` to debug when running the server.
 
 **Important note:** Once an alarm is triggered, press the `Stop Alarm` button to stop it. If the alarm is not stopped within 3 minutes, vPilot will automatically disconnect.
