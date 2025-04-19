@@ -7,6 +7,7 @@ import messaging from '@react-native-firebase/messaging';
 import { NavigationContainer } from "@react-navigation/native";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { Bell, Music, RefreshCw, Settings } from "lucide-react-native";
+import Toast from 'react-native-toast-message';
 import './FirebaseConfig';
 
 const { AlarmSounds } = NativeModules;
@@ -39,6 +40,28 @@ const BaseURLProvider = ({ children }) => {
   const updateBaseURL = async (newURL) => {
     setBaseURL(newURL);
     await AsyncStorage.setItem("baseURL", newURL);
+
+    try {
+      const response = await fetch(`${baseURL}/notifications`);
+      if (!response.ok) {
+        throw new Error(`Unable to communicate with API, got: ${response.status}`);
+      }
+      await response.json();
+    } catch(error) {
+      console.log(error);
+      Toast.show({
+        type: "error",
+        text1: "Error",
+        text2: `Unable to communicate with API: ${error}`,
+      })
+      return;
+    }
+
+    Toast.show({
+      type: "success",
+      text1: "Success",
+      text2: "Base URL updated",
+    })
   };
 
   useEffect(() => {
@@ -329,6 +352,7 @@ const App = () => {
           <Tab.Screen name="Settings" component={SettingsScreen} />
         </Tab.Navigator>
       </NavigationContainer>
+      <Toast />
     </BaseURLProvider>
   );
 };
