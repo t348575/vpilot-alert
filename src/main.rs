@@ -1,20 +1,12 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     routing::{delete, get, post},
     Json, Router,
 };
-use chrono::Local;
 use clap::Parser;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::{
-    path::Path,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use serde::Deserialize;
+use std::sync::Arc;
 use tokio::{
     fs::{read_to_string, write},
     spawn,
@@ -32,128 +24,15 @@ use tracing_subscriber::{
     EnvFilter,
 };
 
-#[derive(Serialize)]
-struct Claims {
-    iss: String,
-    scope: String,
-    aud: String,
-    exp: u64,
-    iat: u64,
-}
+use crate::{
+    fcm::GoogleServices,
+    route::{Route, RouteStatistics},
+    state::{AppState, AppStateType, Notification, NotificationType},
+};
 
-fn generate_jwt(private_key: &str, client_email: &str) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs();
-
-    let claims = Claims {
-        iss: client_email.to_string(),
-        scope: "https://www.googleapis.com/auth/firebase.messaging".to_string(),
-        aud: "https://oauth2.googleapis.com/token".to_string(),
-        exp: now + 3600,
-        iat: now,
-    };
-
-    let encoding_key =
-        EncodingKey::from_rsa_pem(private_key.as_bytes()).expect("Failed to read private key");
-
-    encode(&Header::new(Algorithm::RS256), &claims, &encoding_key).expect("Failed to encode JWT")
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token: String,
-}
-
-async fn get_oauth_token(jwt: &str) -> String {
-    let client = Client::new();
-    let params = [
-        ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-        ("assertion", jwt),
-    ];
-
-    let response = client
-        .post("https://oauth2.googleapis.com/token")
-        .form(&params)
-        .send()
-        .await
-        .expect("Failed to send request");
-
-    let token_response: TokenResponse = response
-        .json()
-        .await
-        .expect("Failed to parse token response");
-
-    token_response.access_token
-}
-
-type AppStateType = Arc<Mutex<AppState>>;
-
-struct AppState {
-    recipient_token: String,
-    oauth_token: String,
-    notifications: Vec<Notification>,
-    callsign: String,
-    vpilot_connected: bool,
-    alarm: Option<Instant>,
-}
-
-impl AppState {
-    async fn send_fcm_message(&self, data: serde_json::Value) {
-        let client = Client::new();
-        let message = json!({
-            "message": {
-                "token": self.recipient_token,
-                "data": data,
-                "webpush": {
-                    "headers": {
-                        "Urgency": "high"
-                    }
-                },
-                "android":{
-                    "priority": "high"
-                },
-                "apns": {
-                    "headers": {
-                        "apns-priority": "10"
-                    }
-                },
-            }
-        });
-
-        let response = client
-            .post("https://fcm.googleapis.com/v1/projects/vpilot-alert/messages:send")
-            .bearer_auth(self.oauth_token.clone())
-            .json(&message)
-            .send()
-            .await
-            .expect("Failed to send FCM message");
-
-        if response.status().is_success() {
-            debug!("FCM message sent successfully!");
-        } else {
-            debug!(
-                "Failed to send FCM message: {}",
-                response.text().await.expect("Failed to read response text")
-            );
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-enum NotificationType {
-    PrivateMessage,
-    RadioMessage,
-    SelcalAlert,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct Notification {
-    message: String,
-    timestamp: String,
-    _type: NotificationType,
-}
+mod fcm;
+mod route;
+mod state;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -162,15 +41,13 @@ struct Args {
     #[arg(short, long)]
     callsign: String,
 
+    /// Navigation database path
+    #[arg(short, long)]
+    nav_db_path: String,
+
     /// Interface to run server on
     #[arg(short, long, default_value = "0.0.0.0:8080")]
     interface: String,
-}
-
-#[derive(Deserialize)]
-struct GoogleServices {
-    private_key: String,
-    client_email: String,
 }
 
 fn get_layer<S>(
@@ -198,7 +75,7 @@ async fn main() {
 
     let args = Args::parse();
 
-    let token_path = Path::new("token");
+    let token_path = std::path::Path::new("token");
     let token = if token_path.exists() {
         read_to_string(token_path)
             .await
@@ -213,16 +90,27 @@ async fn main() {
             .expect("Failed to read google-services.json"),
     )
     .expect("Failed to parse google-services.json");
-    let jwt = generate_jwt(&google_services.private_key, &google_services.client_email);
-    let oauth_token = get_oauth_token(&jwt).await;
+    google_services
+        .login()
+        .await
+        .expect("Failed to login to google services");
+
+    let mut route = Route::new(&args.nav_db_path, &args.callsign).expect("Failed to create route");
+    let stats = route
+        .route_statistics()
+        .await
+        .expect("Failed to get route statistics");
 
     let app_state = Arc::new(Mutex::new(AppState {
         recipient_token: token,
-        oauth_token,
+        google_services,
         notifications: Vec::new(),
         callsign: args.callsign,
         vpilot_connected: true,
         alarm: None,
+        stats,
+        route,
+        alert_crashes: false,
     }));
     let api_router = Router::new()
         .route("/fcm-token", post(save_token))
@@ -233,8 +121,15 @@ async fn main() {
             "/connection-status",
             delete(set_disconnect_vpilot).get(get_connection_status),
         )
-        .route("/notifications", get(get_notifications))
-        .route("/alarm", delete(stop_alarm))
+        .route(
+            "/notifications",
+            get(get_notifications).delete(clear_notifications),
+        )
+        .route("/alert_crashes/{alert_crashes}", post(set_alert_crashes))
+        .route("/alert_crashes", get(get_alert_crashes))
+        .route("/stats", get(get_stats))
+        .route("/alarm", delete(stop_alarm).post(received_alarm))
+        .route("/notify", post(send_notification))
         .with_state(app_state.clone());
 
     let app = Router::new()
@@ -242,23 +137,9 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .fallback(handler_404);
 
-    spawn(async move {
-        loop {
-            let mut state = app_state.lock().await;
-            if let Some(alarm) = state.alarm {
-                if alarm.elapsed() > Duration::from_secs(180) {
-                    state.vpilot_connected = false;
-                    state.alarm = None;
-                    error!("Alarm time exceeded, disconnecting from vatsim");
-                }
-            }
-            drop(state);
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    });
+    spawn(AppState::state_loop(app_state));
 
     debug!("Starting server on 8080");
-
     let listener = tokio::net::TcpListener::bind(args.interface).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
@@ -287,20 +168,21 @@ struct PrivateMessage {
     from: String,
     message: String,
 }
+
 async fn private_message(
     state: State<AppStateType>,
     Json(payload): Json<PrivateMessage>,
 ) -> StatusCode {
     let mut state = state.lock().await;
-    state
-        .send_fcm_message(json!({ "triggerAlarm": "true" }))
-        .await;
-    state.notifications.push(Notification {
-        message: payload.message,
-        timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        _type: NotificationType::PrivateMessage,
-    });
-    state.alarm = Some(Instant::now());
+    if let Err(err) = state
+        .send_notification(
+            format!("{}: {}", payload.from, payload.message),
+            NotificationType::PrivateMessage,
+        )
+        .await
+    {
+        error!("Failed to send notification: {}", err);
+    }
     StatusCode::OK
 }
 
@@ -321,15 +203,18 @@ async fn radio_message(
         .to_lowercase()
         .contains(state.callsign.to_lowercase().as_str())
     {
-        state
-            .send_fcm_message(json!({ "triggerAlarm": "true" }))
-            .await;
-        state.notifications.push(Notification {
-            message: format!("Radio message received from {}", payload.from),
-            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            _type: NotificationType::RadioMessage,
-        });
-        state.alarm = Some(Instant::now());
+        if let Err(err) = state
+            .send_notification(
+                format!(
+                    "{} @ {:?}: {}",
+                    payload.from, payload.frequencies, payload.message
+                ),
+                NotificationType::RadioMessage,
+            )
+            .await
+        {
+            error!("Failed to send notification: {}", err);
+        }
     }
     StatusCode::OK
 }
@@ -341,15 +226,15 @@ struct SelcalAlert {
 }
 async fn selcal_alert(state: State<AppStateType>, Json(payload): Json<SelcalAlert>) -> StatusCode {
     let mut state = state.lock().await;
-    state
-        .send_fcm_message(json!({ "triggerAlarm": "true" }))
-        .await;
-    state.notifications.push(Notification {
-        message: format!("SELCAL received from {}", payload.from),
-        timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        _type: NotificationType::SelcalAlert,
-    });
-    state.alarm = Some(Instant::now());
+    if let Err(err) = state
+        .send_notification(
+            format!("SELCAL {} @ {:?}", payload.from, payload.frequencies),
+            NotificationType::SelcalAlert,
+        )
+        .await
+    {
+        error!("Failed to send notification: {}", err);
+    }
     StatusCode::OK
 }
 
@@ -366,6 +251,11 @@ async fn get_notifications(state: State<AppStateType>) -> Json<Vec<Notification>
     let state = state.lock().await;
     Json(state.notifications.clone())
 }
+async fn clear_notifications(state: State<AppStateType>) -> StatusCode {
+    let mut state = state.lock().await;
+    state.notifications.clear();
+    StatusCode::OK
+}
 
 async fn stop_alarm(state: State<AppStateType>) -> StatusCode {
     let mut state = state.lock().await;
@@ -373,5 +263,51 @@ async fn stop_alarm(state: State<AppStateType>) -> StatusCode {
         state.alarm = None;
     }
 
+    StatusCode::OK
+}
+
+async fn received_alarm(state: State<AppStateType>) -> StatusCode {
+    let mut state = state.lock().await;
+    if let Some(alarm) = &mut state.alarm {
+        alarm.alarm_played = true;
+    };
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct SetAlertCrashes {
+    alert_crashes: bool,
+}
+
+async fn set_alert_crashes(
+    Path(SetAlertCrashes { alert_crashes }): Path<SetAlertCrashes>,
+    state: State<AppStateType>,
+) -> StatusCode {
+    let mut state = state.lock().await;
+    state.alert_crashes = alert_crashes;
+    StatusCode::OK
+}
+
+async fn get_alert_crashes(state: State<AppStateType>) -> Json<bool> {
+    let state = state.lock().await;
+    Json(state.alert_crashes)
+}
+
+async fn get_stats(state: State<AppStateType>) -> Json<RouteStatistics> {
+    let state = state.lock().await;
+    Json(state.stats.clone())
+}
+
+async fn send_notification(state: State<AppStateType>) -> StatusCode {
+    let mut state = state.lock().await;
+    if let Err(err) = state
+        .send_notification(
+            "Test notification".to_string(),
+            NotificationType::PrivateMessage,
+        )
+        .await
+    {
+        error!("Failed to send notification: {}", err);
+    }
     StatusCode::OK
 }

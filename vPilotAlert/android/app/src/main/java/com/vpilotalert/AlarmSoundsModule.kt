@@ -83,4 +83,12 @@ class AlarmSoundsModule(reactContext: ReactApplicationContext) : ReactContextBas
         }
         mediaPlayer = null
     }
+
+    @ReactMethod(isBlockingSynchronousMethod = true)
+    fun isPlaying(): Boolean {
+        mediaPlayer?.let {
+            return it.isPlaying
+        }
+        return false
+    }
 }
