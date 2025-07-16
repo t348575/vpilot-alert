@@ -1,11 +1,11 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, FlatList, TouchableOpacity } from 'react-native';
+import React, {useEffect, useState} from 'react';
+import {View, Text, FlatList, TouchableOpacity} from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Sound from 'react-native-sound';
-import { NativeModules } from 'react-native';
-import { useBaseURL } from '../contexts/BaseURL';
+import {NativeModules} from 'react-native';
+import {useBaseURL} from '../contexts/BaseURL';
 import styles from '../styles';
-const { AlarmSounds } = NativeModules;
+const {AlarmSounds} = NativeModules;
 
 interface SoundData {
   title: string;
@@ -13,14 +13,14 @@ interface SoundData {
 }
 
 const AlarmSoundsScreen = () => {
-  const { baseURL } = useBaseURL();
+  const {baseURL} = useBaseURL();
   const [sounds, setSounds] = useState<SoundData[]>([]);
   const [selectedSound, setSelectedSound] = useState<string | null>(null);
   const [currentSound, setCurrentSound] = useState<Sound | null>(null);
 
   useEffect(() => {
     const loadSelectedSound = async () => {
-      const savedUri = await AsyncStorage.getItem("selectedSound");
+      const savedUri = await AsyncStorage.getItem('selectedSound');
       if (savedUri) setSelectedSound(savedUri);
     };
     loadSelectedSound();
@@ -32,7 +32,7 @@ const AlarmSoundsScreen = () => {
         const result = await AlarmSounds.getAlarmSounds();
         setSounds(JSON.parse(result));
       } catch (error) {
-        console.error("Error fetching sounds:", error);
+        console.error('Error fetching sounds:', error);
       }
     };
     fetchSounds();
@@ -40,21 +40,26 @@ const AlarmSoundsScreen = () => {
 
   const playSound = (uri: string) => {
     if (currentSound) {
-      currentSound.stop(() => { currentSound.release(); });
+      currentSound.stop(() => {
+        currentSound.release();
+      });
     }
-    const sound = new Sound(uri, "", (error) => {
+    const sound = new Sound(uri, '', error => {
       if (error) {
-        console.error("Failed to load the sound", error);
+        console.error('Failed to load the sound', error);
         return;
       }
       setCurrentSound(sound);
-      sound.play((success) => {
+      sound.play(success => {
         if (!success) {
-          console.error("Playback failed due to audio decoding errors");
+          console.error('Playback failed due to audio decoding errors');
         }
       });
       setTimeout(() => {
-        sound.stop(() => { sound.release(); setCurrentSound(null); });
+        sound.stop(() => {
+          sound.release();
+          setCurrentSound(null);
+        });
       }, 5000);
     });
   };
@@ -66,19 +71,21 @@ const AlarmSoundsScreen = () => {
 
   const stopAlarm = async () => {
     AlarmSounds.stopSound();
-    await fetch(`${baseURL}/alarm`, { method: "DELETE" });
+    await fetch(`${baseURL}/alarm`, {method: 'DELETE'});
   };
 
   return (
     <View style={styles.container}>
       <FlatList
         data={sounds}
-        keyExtractor={(item) => item.uri}
-        renderItem={({ item }) => (
+        keyExtractor={item => item.uri}
+        renderItem={({item}) => (
           <TouchableOpacity
             style={styles.soundItem}
-            onPress={() => { playSound(item.uri); selectSound(item.uri); }}
-          >
+            onPress={() => {
+              playSound(item.uri);
+              selectSound(item.uri);
+            }}>
             <Text>{item.title}</Text>
           </TouchableOpacity>
         )}

@@ -133,3 +133,7 @@ project.ext.react = [
     bundleInDebug: true,
     bundleInRelease: true
 ]
+
+tasks.withType(JavaCompile) {
+    options.compilerArgs << "-Xlint:unchecked"
+}

@@ -1,12 +1,16 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     thread,
     time::{Duration, Instant},
 };
 
+use chrono::{Local, Utc};
 use eyre::{bail, Context, ContextCompat, Result};
 use flume::{bounded, Receiver, Sender};
-use geo::{Closest, Distance, Haversine, HaversineClosestPoint, Intersects, Line, Point};
+use geo::{
+    Bearing, Closest, Destination, Distance, Haversine, HaversineClosestPoint, Intersects, Line,
+    Point,
+};
 use regex::Regex;
 use reqwest::get;
 use rusqlite::Connection;
@@ -34,6 +38,7 @@ pub struct FlightPlan {
     pub departure: String,
     pub arrival: String,
     pub route: String,
+    pub enroute_time: String,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +73,14 @@ pub struct Route {
     last_stat: RouteStatistics,
     tx: Sender<RouteRequest>,
     rx: Receiver<Result<Vec<Waypoint>>>,
+    weather_cache: HashMap<String, WeatherData>,
+}
+
+struct WeatherData {
+    last_update: Instant,
+    ws: f64,
+    wd: f64,
+    temp_k: f64,
 }
 
 struct RouteRequest {
@@ -103,6 +116,7 @@ pub struct RouteStatistics {
     pub in_loop: bool,
     pub stuck: bool,
     pub pilot: Pilot,
+    pub eta: String,
 }
 
 impl Route {
@@ -110,7 +124,8 @@ impl Route {
         let conn = Connection::open(nav_db).context("Could not open nav db")?;
         let (tx, rx) = bounded(1);
         let (tx_r, rx_r) = bounded(1);
-        thread::spawn(move || InnerRoute::start(InnerRoute { conn }, tx_r, rx));
+        let ir = InnerRoute::new(conn)?;
+        thread::spawn(move || InnerRoute::start(ir, tx_r, rx));
 
         Ok(Route {
             callsign: callsign.to_owned(),
@@ -123,6 +138,7 @@ impl Route {
             last_stat: RouteStatistics::default(),
             tx,
             rx: rx_r,
+            weather_cache: HashMap::new(),
         })
     }
 
@@ -178,8 +194,9 @@ impl Route {
             self.route_waypoints = self.rx.recv_async().await??;
 
             debug!("recomputing route waypoints");
+            debug!("FP route: {:#?}", flight_plan.route);
             debug!(
-                "new route: {:#?}",
+                "route: {:#?}",
                 self.route_waypoints
                     .iter()
                     .map(|w| w.id.as_str())
@@ -220,9 +237,18 @@ impl Route {
         let leftover: Vec<String> = self
             .route_waypoints
             .iter()
-            .skip(prev_idx)
+            .skip(prev_idx + 1)
             .map(|wpt| wpt.id.clone())
             .collect();
+
+        let mut leftover_wpts = self
+            .route_waypoints
+            .iter()
+            .skip(prev_idx + 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        leftover_wpts.insert(0, Waypoint::unknown(pilot.latitude, pilot.longitude));
+        let eta = self.calculate_eta(leftover_wpts).await?;
 
         self.last_stat = RouteStatistics {
             leftover_route: leftover,
@@ -234,17 +260,110 @@ impl Route {
             in_loop,
             stuck,
             pilot,
+            eta,
         };
 
         Ok(self.last_stat.clone())
     }
+
+    async fn calculate_eta(&mut self, route: Vec<Waypoint>) -> Result<String> {
+        let mut total_seconds = 0f64;
+        let mach = 0.86;
+
+        for pair in route.windows(2) {
+            let a = Point::new(pair[0].lon, pair[0].lat);
+            let b = Point::new(pair[1].lon, pair[1].lat);
+            let dist = Haversine.distance(a, b);
+            let track = Haversine.bearing(a, b).to_radians();
+            let midpoint = Haversine.destination(a, track, dist / 2.0);
+
+            let dist_nm = dist / 1852.0;
+            let (ws, wd, temp_k) = self.fetch_weather(midpoint.y(), midpoint.x()).await?;
+            let tas = mach_to_tas(mach, temp_k);
+            let hw = wind_component(ws, wd, track);
+            let gs = tas + hw;
+            let time_h = dist_nm / gs;
+            total_seconds += time_h * 3600.0;
+        }
+
+        let now = Utc::now();
+        let dur = Duration::from_secs(total_seconds.round() as u64);
+        let eta = now + dur;
+        let eta_local = eta.with_timezone(&Local);
+        Ok(eta_local.format("%Y-%m-%d %H:%M %Z").to_string())
+    }
+
+    async fn fetch_weather(&mut self, lat: f64, lon: f64) -> Result<(f64, f64, f64)> {
+        if let Some(weather) = self.weather_cache.get(&format!("{lat},{lon}")) {
+            if weather.last_update.elapsed() < Duration::from_secs(60 * 30) {
+                return Ok((weather.ws, weather.wd, weather.temp_k));
+            }
+        }
+
+        let url = format!("https://api.open-meteo.com/v1/gfs?latitude={lat}&longitude={lon}&hourly=windspeed_250hPa,winddirection_250hPa,temperature_250hPa");
+        let resp = get(&url).await?.json::<GfsResponse>().await?;
+        let ws = resp.hourly.wind_speed_250h_pa[0];
+        let wd = resp.hourly.wind_direction_250h_pa[0];
+        let temp_k = resp.hourly.temperature_250h_pa[0] + 273.15;
+        let entry = self
+            .weather_cache
+            .entry(format!("{lat},{lon}"))
+            .or_insert(WeatherData {
+                last_update: Instant::now(),
+                ws,
+                wd,
+                temp_k,
+            });
+        *entry = WeatherData {
+            last_update: Instant::now(),
+            ws,
+            wd,
+            temp_k,
+        };
+        Ok((ws, wd, temp_k))
+    }
+}
+
+#[derive(Deserialize)]
+struct GfsResponse {
+    hourly: GfsHourly,
+}
+
+#[derive(Deserialize)]
+struct GfsHourly {
+    #[serde(rename = "windspeed_250hPa")]
+    wind_speed_250h_pa: Vec<f64>,
+    #[serde(rename = "winddirection_250hPa")]
+    wind_direction_250h_pa: Vec<f64>,
+    #[serde(rename = "temperature_250hPa")]
+    temperature_250h_pa: Vec<f64>,
+}
+
+fn mach_to_tas(mach: f64, temp_k: f64) -> f64 {
+    mach * 39.0 * temp_k.sqrt()
+}
+
+fn wind_component(ws: f64, wd: f64, track: f64) -> f64 {
+    (wd - track).to_radians().cos() * ws
 }
 
 struct InnerRoute {
     conn: Connection,
+    db_version: usize,
 }
 
 impl InnerRoute {
+    fn new(conn: Connection) -> Result<InnerRoute> {
+        let mut stmt = conn.prepare(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='tbl_header')",
+        )?;
+        let exists: bool = stmt.query_row([], |row| row.get(0))?;
+        let db_version = if exists { 1 } else { 2 };
+        drop(stmt);
+        debug!("Database version: {db_version}");
+        Ok(InnerRoute { conn, db_version })
+    }
+
     fn start(self, tx: Sender<Result<Vec<Waypoint>>>, rx: Receiver<RouteRequest>) {
         while let Ok(RouteRequest {
             route_tokens,
@@ -255,6 +374,34 @@ impl InnerRoute {
                 error!("Failed to send waypoints: {err}");
             }
         }
+    }
+
+    fn map_table(&self, table: &'static str) -> &'static str {
+        if self.db_version == 1 {
+            return table;
+        }
+
+        match table {
+            "tbl_enroute_airways" => "tbl_er_enroute_airways",
+            "tbl_airports" => "tbl_pa_airports",
+            "tbl_enroute_waypoints" => "tbl_ea_enroute_waypoints",
+            "tbl_terminal_waypoints" => "tbl_pc_terminal_waypoints",
+            "tbl_vhfnavaids" => "tbl_d_vhfnavaids",
+            "tbl_enroute_ndbnavaids" => "tbl_db_enroute_ndbnavaids",
+            "tbl_terminal_ndbnavaids" => "tbl_pn_terminal_ndbnavaids",
+            "tbl_sids" => "tbl_pd_sids",
+            "tbl_stars" => "tbl_pe_stars",
+            _ => unreachable!(),
+        }
+    }
+
+    fn map_navaid_table_column(&self, table: &'static str, column: &'static str) -> String {
+        if self.db_version == 1 {
+            return column.to_owned();
+        }
+
+        assert!(table.contains("vhf") | table.contains("ndb"));
+        column.replace("vor", "navaid").replace("ndb", "navaid")
     }
 
     fn get_waypoints(
@@ -335,8 +482,8 @@ impl InnerRoute {
                 let mut best = None;
                 for cand in fixes {
                     let dist = Haversine.distance(
-                        geo::Point::new(prev.lon, prev.lat),
-                        geo::Point::new(cand.lon, cand.lat),
+                        Point::new(prev.lon, prev.lat),
+                        Point::new(cand.lon, cand.lat),
                     );
                     if dist < min_dist {
                         min_dist = dist;
@@ -368,7 +515,8 @@ impl InnerRoute {
         exit_fix: String,
     ) -> Result<Vec<Waypoint>> {
         let mut out = Vec::new();
-        let mut stmt = self.conn.prepare("SELECT waypoint_identifier, waypoint_latitude, waypoint_longitude FROM tbl_enroute_airways WHERE route_identifier = ? ORDER BY seqno DESC")?;
+        let query = format!("SELECT waypoint_identifier, waypoint_latitude, waypoint_longitude FROM {} WHERE route_identifier = ? ORDER BY seqno DESC",  self.map_table("tbl_enroute_airways"));
+        let mut stmt = self.conn.prepare(&query)?;
         let mut rows = stmt.query([awy.clone()])?;
         while let Ok(Some(r)) = rows.next() {
             out.push(Waypoint::new(r.get(0)?, r.get(1)?, r.get(2)?));
@@ -398,9 +546,8 @@ impl InnerRoute {
     }
 
     fn get_airport(&self, ident: String) -> Option<Waypoint> {
-        let mut stmt = self.conn.prepare(
-        "SELECT airport_ref_latitude, airport_ref_longitude FROM tbl_airports WHERE airport_identifier = ?"
-    ).unwrap();
+        let query = format!("SELECT airport_ref_latitude, airport_ref_longitude FROM {} WHERE airport_identifier = ?", self.map_table("tbl_airports"));
+        let mut stmt = self.conn.prepare(&query).unwrap();
         stmt.query_row([ident.clone()], |r| Ok((r.get(0)?, r.get(1)?)))
             .map(|row| Waypoint::new(ident, row.0, row.1))
             .ok()
@@ -413,22 +560,45 @@ impl InnerRoute {
             let mut stmt = self.conn.prepare(sql)?;
             let mut rows = stmt.query([&ident])?;
             while let Ok(Some(row)) = rows.next() {
-                candidates.push(Waypoint::new(ident.clone(), row.get(0)?, row.get(1)?));
+                let lat: Option<f64> = row.get(0)?;
+                let (lat, lon) = match lat {
+                    Some(lat) => (lat, row.get(1)?),
+                    None => (row.get(2)?, row.get(3)?),
+                };
+                candidates.push(Waypoint::new(ident.clone(), lat, lon));
             }
             Ok(())
         };
 
-        try_stmt("SELECT waypoint_latitude, waypoint_longitude FROM tbl_enroute_waypoints WHERE waypoint_identifier = ?")?;
-        try_stmt("SELECT waypoint_latitude, waypoint_longitude FROM tbl_terminal_waypoints WHERE waypoint_identifier = ?")?;
-        try_stmt(
-            "SELECT vor_latitude, vor_longitude FROM tbl_vhfnavaids WHERE vor_identifier = ?",
-        )?;
-        try_stmt(
-            "SELECT ndb_latitude, ndb_longitude FROM tbl_enroute_ndbnavaids WHERE ndb_identifier = ?",
-        )?;
-        try_stmt(
-            "SELECT ndb_latitude, ndb_longitude FROM tbl_terminal_ndbnavaids WHERE ndb_identifier = ?",
-        )?;
+        try_stmt(&format!(
+            "SELECT waypoint_latitude, waypoint_longitude FROM {} WHERE waypoint_identifier = ?",
+            self.map_table("tbl_enroute_waypoints")
+        ))?;
+        try_stmt(&format!(
+            "SELECT waypoint_latitude, waypoint_longitude FROM {} WHERE waypoint_identifier = ?",
+            self.map_table("tbl_terminal_waypoints")
+        ))?;
+        try_stmt(&format!(
+            "SELECT dme_latitude, dme_longitude, {}, {} FROM {} WHERE {} = ?",
+            self.map_navaid_table_column("tbl_vhfnavaids", "vor_latitude"),
+            self.map_navaid_table_column("tbl_vhfnavaids", "vor_longitude"),
+            self.map_table("tbl_vhfnavaids"),
+            self.map_navaid_table_column("tbl_vhfnavaids", "vor_identifier")
+        ))?;
+        try_stmt(&format!(
+            "SELECT {}, {} FROM {} WHERE {} = ?",
+            self.map_navaid_table_column("tbl_enroute_ndbnavaids", "ndb_latitude"),
+            self.map_navaid_table_column("tbl_enroute_ndbnavaids", "ndb_longitude"),
+            self.map_table("tbl_enroute_ndbnavaids"),
+            self.map_navaid_table_column("tbl_enroute_ndbnavaids", "ndb_identifier")
+        ))?;
+        try_stmt(&format!(
+            "SELECT {}, {} FROM {} WHERE {} = ?",
+            self.map_navaid_table_column("tbl_terminal_ndbnavaids", "ndb_latitude"),
+            self.map_navaid_table_column("tbl_terminal_ndbnavaids", "ndb_longitude"),
+            self.map_table("tbl_terminal_ndbnavaids"),
+            self.map_navaid_table_column("tbl_terminal_ndbnavaids", "ndb_identifier")
+        ))?;
 
         Ok(candidates)
     }
@@ -440,8 +610,8 @@ impl InnerRoute {
         kind: char,
     ) -> Result<Vec<Waypoint>> {
         let table = match kind {
-            'D' => "tbl_sids",
-            'A' => "tbl_stars",
+            'D' => self.map_table("tbl_sids"),
+            'A' => self.map_table("tbl_stars"),
             _ => unreachable!(),
         };
 
@@ -461,15 +631,19 @@ impl InnerRoute {
         let mut stmt = self.conn.prepare(&sql).unwrap();
         let mut rows = stmt.query([&airport]).unwrap();
 
-        let mut best: Option<(String, Option<String>)> = None;
-        let mut best_score = 0;
-
+        let mut candidates = Vec::new();
         while let Ok(Some(r)) = rows.next() {
             let proc_id: String = r.get(0)?;
             let trans_id: Option<String> = r.get(1)?;
+            candidates.push((proc_id, trans_id));
+        }
 
+        let mut best: Option<(String, Option<String>)> = None;
+        let mut best_score = 0;
+
+        for (proc_id, trans_id) in &candidates {
             let full_key = match &trans_id {
-                Some(t) => proc_id.clone() + t,
+                Some(t) => proc_id.clone() + if t.starts_with("RW") { "" } else { t },
                 None => proc_id.clone(),
             };
 
@@ -481,6 +655,15 @@ impl InnerRoute {
             if score > best_score {
                 best_score = score;
                 best = Some((proc_id.clone(), trans_id.clone()));
+            }
+        }
+
+        if best_score == 0 {
+            for (proc_id, trans_id) in &candidates {
+                if raw.eq_ignore_ascii_case(proc_id) {
+                    best = Some((proc_id.clone(), trans_id.clone()));
+                    break;
+                }
             }
         }
 

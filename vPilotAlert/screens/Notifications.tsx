@@ -1,12 +1,18 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, FlatList, TouchableOpacity, ActivityIndicator } from 'react-native';
+import React, {useEffect, useState} from 'react';
+import {
+  View,
+  Text,
+  FlatList,
+  TouchableOpacity,
+  ActivityIndicator,
+} from 'react-native';
 import Toast from 'react-native-toast-message';
-import { RefreshCw, Trash2 } from "lucide-react-native";
-import { useBaseURL } from '../contexts/BaseURL';
+import {RefreshCw, Trash2} from 'lucide-react-native';
+import {useBaseURL} from '../contexts/BaseURL';
 import styles from '../styles';
 
 const NotificationsScreen = () => {
-  const { baseURL } = useBaseURL();
+  const {baseURL} = useBaseURL();
   const [notifications, setNotifications] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -32,9 +38,9 @@ const NotificationsScreen = () => {
 
   const clearNotifications = async () => {
     try {
-      await fetch(`${baseURL}/notifications`, { method: 'DELETE' });
+      await fetch(`${baseURL}/notifications`, {method: 'DELETE'});
       setNotifications([]);
-      Toast.show({ type: 'success', text1: 'Notifications cleared' });
+      Toast.show({type: 'success', text1: 'Notifications cleared'});
     } catch (error) {
       console.error(error);
       Toast.show({
@@ -45,9 +51,11 @@ const NotificationsScreen = () => {
     }
   };
 
-  useEffect(() => { fetchNotifications(); }, []);
+  useEffect(() => {
+    fetchNotifications();
+  }, []);
 
-  const renderNotification = ({ item }) => (
+  const renderNotification = ({item}) => (
     <View style={styles.notificationCard}>
       <Text style={styles.notificationTitle}>{item.type}</Text>
       <Text>{item.message}</Text>
@@ -59,10 +67,14 @@ const NotificationsScreen = () => {
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>Notifications</Text>
-        <TouchableOpacity onPress={refreshNotifications} style={styles.refreshButton}>
+        <TouchableOpacity
+          onPress={refreshNotifications}
+          style={styles.refreshButton}>
           <RefreshCw size={24} color="#007bff" />
         </TouchableOpacity>
-        <TouchableOpacity onPress={clearNotifications} style={styles.clearButton}>
+        <TouchableOpacity
+          onPress={clearNotifications}
+          style={styles.clearButton}>
           <Trash2 size={24} color="#ff3b30" />
         </TouchableOpacity>
       </View>
